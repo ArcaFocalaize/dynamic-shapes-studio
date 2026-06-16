@@ -1,0 +1,744 @@
+<script type="module">
+// ══════════════════════════════════════════════════════════════
+// DYNAMIC SHAPES STUDIO — Application Logic
+// ══════════════════════════════════════════════════════════════
+
+import { buildControlPanel, getDefaultConfig } from './src/ui/controls.js';
+import {
+  generateBlob, generatePolygon, generateStar,
+  generateCluster, interpolateBlob, Easing
+} from './src/core/shapes.js';
+import { pointsToSVGPath, drawSplineOnCanvas } from './src/core/spline.js';
+import { PhysicsBlob, applyRepulsion, applyAttraction } from './src/core/physics.js';
+import { SVGRenderer }    from './src/renderers/svg.js';
+import { CanvasRenderer } from './src/renderers/canvas.js';
+import { WebGLRenderer }  from './src/renderers/webgl.js';
+import { downloadSVG, getSVGString, copySVGToClipboard } from './src/exporters/exportSVG.js';
+import { downloadCanvasPNG, svgToPNG } from './src/exporters/exportPNG.js';
+import { generateCSSKeyframes, generateBorderRadiusBlob, downloadCSS } from './src/exporters/exportCSS.js';
+import { downloadJSON, generateLottieJSON, configToJSON } from './src/exporters/exportJSON.js';
+import { generateReactComponent, generateReactHook, downloadReactComponent } from './src/exporters/exportReact.js';
+import { GIFRecorder } from './src/exporters/exportGIF.js';
+
+// ── Stato globale ─────────────────────────────────────────────
+let config = getDefaultConfig();
+let renderer   = null;      // SVGRenderer | CanvasRenderer | WebGLRenderer
+let stopLoop   = null;      // funzione stop() del loop corrente
+let rafId      = null;
+let frameCount = 0;
+let lastFpsTime = performance.now();
+let fps = 0;
+let gifRecorder = null;
+let recordingPathFrames = [];  // path SVG per Lottie/CSS export
+let physBlobs  = [];           // per cluster con fisica
+
+const wrapper       = document.getElementById('canvas-wrapper');
+const controlsEl    = document.getElementById('dss-controls');
+const rendererSel   = document.getElementById('renderer-select');
+const infoRenderer  = document.getElementById('info-renderer');
+const infoSize      = document.getElementById('info-size');
+const infoPoints    = document.getElementById('info-points');
+const infoShape     = document.getElementById('info-shape');
+const infoFrame     = document.getElementById('info-frame');
+const fpsCounter    = document.getElementById('fps-counter');
+
+// ── Toast ─────────────────────────────────────────────────────
+function toast(msg, duration = 2200) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), duration);
+}
+
+// ── Costruisce il pannello controlli ──────────────────────────
+const { setControl } = buildControlPanel(controlsEl, (key, value, newConfig) => {
+  config = newConfig;
+  if (key === 'width' || key === 'height') {
+    rebuildRenderer();
+  } else if (key === 'renderer') {
+    rebuildRenderer();
+  }
+  updateInfoBar();
+});
+
+// ── Sincronizza renderer select con config ────────────────────
+rendererSel.addEventListener('change', () => {
+  config.renderer = rendererSel.value;
+  setControl('renderer', rendererSel.value);
+  rebuildRenderer();
+});
+
+// ── Costruisce / ricrea il renderer ──────────────────────────
+function rebuildRenderer() {
+  // Ferma loop corrente
+  if (stopLoop) { stopLoop(); stopLoop = null; }
+  if (rafId)    { cancelAnimationFrame(rafId); rafId = null; }
+
+  // Svuota wrapper
+  wrapper.innerHTML = '';
+  wrapper.style.width  = config.width  + 'px';
+  wrapper.style.height = config.height + 'px';
+
+  const r = config.renderer;
+  rendererSel.value = r;
+  infoRenderer.textContent = r.toUpperCase();
+
+  if (r === 'svg') {
+    renderer = new SVGRenderer({ container: wrapper, width: config.width, height: config.height });
+    // Gradiente e filtro gooey sempre pronti
+    renderer.addGradient({
+      id: 'grad-radial',
+      type: 'radial',
+      stops: [
+        { offset: '0%', color: config.fill, opacity: 1 },
+        { offset: '100%', color: config.fillColor2, opacity: 0.6 },
+      ]
+    });
+    renderer.addGradient({
+      id: 'grad-linear',
+      type: 'linear',
+      x1: 0, y1: 0, x2: 1, y2: 1,
+      stops: [
+        { offset: '0%', color: config.fill },
+        { offset: '100%', color: config.fillColor2 },
+      ]
+    });
+    renderer.addGooeyFilter('gooey', 10, 18, 7);
+  } else if (r === 'canvas') {
+    renderer = new CanvasRenderer({ container: wrapper, width: config.width, height: config.height });
+  } else {
+    renderer = new WebGLRenderer({ container: wrapper, width: config.width, height: config.height });
+  }
+
+  // Reinizializza fisica per cluster
+  if (config.shapeType === 'cluster' || config.shapeType === 'metaball') {
+    initPhysics();
+  }
+
+  startLoop();
+  updateInfoBar();
+}
+
+// ── Inizializza fisica per cluster/metaball ───────────────────
+function initPhysics() {
+  const cx = config.width  / 2;
+  const cy = config.height / 2;
+  physBlobs = Array.from({ length: config.clusterCount }, (_, i) => {
+    const angle = (i / config.clusterCount) * Math.PI * 2;
+    return new PhysicsBlob({
+      x: cx + Math.cos(angle) * config.spreadRadius * 0.5,
+      y: cy + Math.sin(angle) * config.spreadRadius * 0.5,
+      vx: (Math.random() - 0.5) * 1.5,
+      vy: (Math.random() - 0.5) * 1.5,
+      radius: config.radius * (0.6 + Math.random() * 0.4),
+    });
+  });
+}
+
+// ── Calcola fill SVG in base a fillMode ───────────────────────
+function getFillAttr() {
+  if (config.fillMode === 'gradient-radial')  return 'url(#grad-radial)';
+  if (config.fillMode === 'gradient-linear')  return 'url(#grad-linear)';
+  if (config.fillMode === 'none')             return 'none';
+  return config.fill;
+}
+
+// ── Genera shape in base al tipo ──────────────────────────────
+function getShapeData(timeOffset) {
+  const cx = config.width  / 2;
+  const cy = config.height / 2;
+
+  switch (config.shapeType) {
+    case 'blob':
+      return [generateBlob({
+        cx, cy,
+        radius:       config.radius,
+        numPoints:    config.numPoints,
+        noiseStrength: config.noiseStrength,
+        noiseScale:   config.noiseScale,
+        timeOffset,
+        seed:         config.seed,
+        tension:      config.tension,
+      })];
+
+    case 'polygon':
+      return [generatePolygon({
+        cx, cy,
+        radius: config.radius,
+        sides:  config.numPoints,
+        rotation: timeOffset * 0.5,
+      })];
+
+    case 'star':
+      return [generateStar({
+        cx, cy,
+        outerR: config.radius,
+        innerR: config.radius * 0.45,
+        points: config.numPoints,
+        rotation: timeOffset * 0.3,
+      })];
+
+    case 'cluster':
+    case 'metaball':
+      applyRepulsion(physBlobs, config.repulsion);
+      applyAttraction(physBlobs, cx, cy, config.attraction);
+      physBlobs.forEach(b => { b.update(); b.bounceWalls(config.width, config.height); });
+      return physBlobs.map((b, i) =>
+        generateBlob({
+          cx: b.x, cy: b.y,
+          radius: b.radius,
+          numPoints: Math.max(6, config.numPoints - 4),
+          noiseStrength: config.noiseStrength,
+          noiseScale: config.noiseScale,
+          timeOffset: timeOffset + i * 0.5,
+          seed: config.seed + i * 0.17,
+          tension: config.tension,
+        })
+      );
+
+    default:
+      return [];
+  }
+}
+
+// ── Frame render ──────────────────────────────────────────────
+let timeOffset = 0;
+
+function renderFrame() {
+  const shapes = getShapeData(timeOffset);
+  const r = config.renderer;
+
+  if (r === 'svg') {
+    renderSVG(shapes);
+  } else if (r === 'canvas') {
+    renderCanvas(shapes);
+  } else {
+    renderWebGL(shapes);
+  }
+
+  // Cattura path per Lottie/CSS export (ogni 8 frame, max 120)
+  if (frameCount % 8 === 0 && recordingPathFrames.length < 120 && shapes[0]) {
+    recordingPathFrames.push(shapes[0].path);
+  }
+
+  // Cattura GIF
+  if (gifRecorder && gifRecorder.isRecording && r === 'canvas') {
+    // già gestito automaticamente dall'interval interno
+  }
+}
+
+function renderSVG(shapes) {
+  const fillAttr = getFillAttr();
+  const style = {
+    fill:          fillAttr,
+    stroke:        config.strokeWidth > 0 ? config.stroke : 'none',
+    strokeWidth:   config.strokeWidth + 'px',
+    opacity:       config.opacity,
+    filter:        config.gooeyEffect ? 'url(#gooey)' : (config.blur > 0 ? `blur(${config.blur}px)` : 'none'),
+  };
+
+  // Aggiorna gradienti con colori correnti
+  renderer.addGradient({
+    id: 'grad-radial', type: 'radial',
+    stops: [
+      { offset: '0%', color: config.fill },
+      { offset: '100%', color: config.fillColor2, opacity: 0.7 },
+    ]
+  });
+  renderer.addGradient({
+    id: 'grad-linear', type: 'linear', x1:0, y1:0, x2:1, y2:1,
+    stops: [
+      { offset: '0%', color: config.fill },
+      { offset: '100%', color: config.fillColor2 },
+    ]
+  });
+
+  // Aggiorna sfondo
+  renderer.svg.style.background = config.background;
+
+  // Pulisce path obsoleti se il numero di shape cambia
+  const currentIds = new Set(shapes.map((_, i) => `shape-${i}`));
+  renderer._paths.forEach((el, id) => {
+    if (!currentIds.has(id)) { el.remove(); renderer._paths.delete(id); }
+  });
+
+  shapes.forEach((shape, i) => {
+    renderer.setPath(`shape-${i}`, shape.path, style);
+  });
+}
+
+function renderCanvas(shapes) {
+  renderer.clear(config.background);
+
+  const fillColor = config.fill;
+  const fillColor2 = config.fillColor2;
+
+  if (config.gooeyEffect && shapes.length > 1) {
+    renderer.drawGooeyGroup(shapes.map(s => s.points), {
+      fill: fillColor,
+      blur: Math.max(config.blur, 10),
+    });
+    return;
+  }
+
+  shapes.forEach(shape => {
+    if (config.fillMode === 'gradient-radial' || config.fillMode === 'gradient-linear') {
+      renderer.drawGradientBlob(shape.points, {
+        colorStops: [fillColor, fillColor2],
+        opacity:    config.opacity,
+        tension:    config.tension,
+      });
+    } else {
+      renderer.drawBlob(shape.points, {
+        fill:        config.fillMode === 'none' ? 'none' : fillColor,
+        stroke:      config.stroke,
+        strokeWidth: config.strokeWidth,
+        opacity:     config.opacity,
+        tension:     config.tension,
+        blur:        config.blur,
+      });
+    }
+  });
+}
+
+function renderWebGL(shapes) {
+  renderer.clearBlobs();
+  // Converte colore hex in [r,g,b] 0-1
+  const hexToRGB = (hex) => {
+    const r = parseInt(hex.slice(1,3),16)/255;
+    const g = parseInt(hex.slice(3,5),16)/255;
+    const b = parseInt(hex.slice(5,7),16)/255;
+    return [r,g,b];
+  };
+  const color = hexToRGB(config.fill);
+
+  shapes.forEach(shape => {
+    // Calcola centroide e raggio approssimato
+    const cx = shape.points.reduce((s,p) => s + p.x, 0) / shape.points.length;
+    const cy = shape.points.reduce((s,p) => s + p.y, 0) / shape.points.length;
+    const r  = shape.points.reduce((s,p) => s + Math.hypot(p.x-cx, p.y-cy), 0) / shape.points.length;
+    renderer.addBlob({ x: cx, y: cy, radius: r, color, alpha: config.opacity });
+  });
+
+  renderer.render();
+}
+
+// ── Loop principale ───────────────────────────────────────────
+function startLoop() {
+  let last = performance.now();
+  let frameNum = 0;
+
+  function tick(now) {
+    rafId = requestAnimationFrame(tick);
+
+    if (config.animated) {
+      timeOffset += config.speed;
+    }
+
+    renderFrame();
+
+    // FPS
+    frameNum++;
+    frameCount++;
+    infoFrame.textContent = frameCount;
+    if (now - lastFpsTime > 500) {
+      fps = Math.round((frameNum * 1000) / (now - lastFpsTime));
+      fpsCounter.textContent = `${fps} fps`;
+      frameNum = 0;
+      lastFpsTime = now;
+    }
+  }
+
+  rafId = requestAnimationFrame(tick);
+}
+
+// ── Info bar ──────────────────────────────────────────────────
+function updateInfoBar() {
+  infoSize.textContent   = `${config.width} × ${config.height}`;
+  infoPoints.textContent = config.numPoints;
+  infoShape.textContent  = config.shapeType;
+}
+
+// ── Randomize ─────────────────────────────────────────────────
+document.getElementById('btn-randomize').addEventListener('click', () => {
+  const rnd = (min, max) => Math.random() * (max - min) + min;
+  const rndInt = (min, max) => Math.floor(rnd(min, max));
+  const rndHex = () => '#' + Array.from({length:6}, () => '0123456789abcdef'[Math.floor(Math.random()*16)]).join('');
+
+  const updates = {
+    seed:          rnd(0, 1),
+    noiseStrength: rnd(10, 100),
+    noiseScale:    rnd(0.2, 2.5),
+    numPoints:     rndInt(5, 20),
+    radius:        rnd(60, 220),
+    tension:       rnd(0.2, 0.8),
+    speed:         rnd(0.001, 0.012),
+    fill:          rndHex(),
+    fillColor2:    rndHex(),
+    background:    '#' + ['0','1','0','0','0','f'].sort(() => Math.random()-.5).join(''),
+    opacity:       rnd(0.7, 1),
+  };
+
+  Object.entries(updates).forEach(([k, v]) => {
+    config[k] = v;
+    setControl(k, v);
+  });
+
+  toast('🎲 Randomizzato!');
+});
+
+// ── Reset ─────────────────────────────────────────────────────
+document.getElementById('btn-reset').addEventListener('click', () => {
+  import('./src/ui/controls.js').then(({ getDefaultConfig, PARAM_DEFS }) => {
+    const defaults = getDefaultConfig();
+    Object.entries(defaults).forEach(([k, v]) => {
+      config[k] = v;
+      setControl(k, v);
+    });
+    rebuildRenderer();
+    toast('↺ Reset effettuato');
+  });
+});
+
+// ── Export SVG ────────────────────────────────────────────────
+document.getElementById('btn-svg').addEventListener('click', () => {
+  if (config.renderer !== 'svg') {
+    toast('⚠ Passa al renderer SVG per esportare SVG');
+    return;
+  }
+  const svgStr = getSVGString(renderer.svg);
+  downloadSVG(svgStr, 'dynamic-shape.svg');
+  toast('✓ SVG scaricato');
+});
+
+// ── Export PNG ────────────────────────────────────────────────
+document.getElementById('btn-png').addEventListener('click', async () => {
+  if (config.renderer === 'canvas') {
+    downloadCanvasPNG(renderer.canvas, 'dynamic-shape.png', 1);
+    toast('✓ PNG scaricato');
+  } else if (config.renderer === 'svg') {
+    const svgStr = getSVGString(renderer.svg);
+    await svgToPNG(svgStr, { width: config.width, height: config.height, scale: 1, filename: 'dynamic-shape.png' });
+    toast('✓ PNG scaricato');
+  } else {
+    const url = renderer.toDataURL();
+    const a = document.createElement('a');
+    a.href = url; a.download = 'dynamic-shape.png';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    toast('✓ PNG scaricato');
+  }
+});
+
+document.getElementById('btn-png2x').addEventListener('click', async () => {
+  if (config.renderer === 'canvas') {
+    downloadCanvasPNG(renderer.canvas, 'dynamic-shape@2x.png', 2);
+    toast('✓ PNG @2x scaricato');
+  } else if (config.renderer === 'svg') {
+    const svgStr = getSVGString(renderer.svg);
+    await svgToPNG(svgStr, { width: config.width, height: config.height, scale: 2, filename: 'dynamic-shape@2x.png' });
+    toast('✓ PNG @2x scaricato');
+  } else {
+    toast('⚠ PNG @2x: usa renderer Canvas o SVG');
+  }
+});
+
+// ── Export CSS ────────────────────────────────────────────────
+document.getElementById('btn-css').addEventListener('click', () => {
+  const paths = recordingPathFrames.length > 2
+    ? recordingPathFrames
+    : [recordingPathFrames[0] || ''];
+
+  // Sia clip-path animation che border-radius blob
+  const kf1 = generateCSSKeyframes({ name: 'dsBlobClip', paths, property: 'clip-path' });
+  const kf2 = generateCSSKeyframes({ name: 'dsBlobD',    paths, property: 'd' });
+  const { full: brFull } = generateBorderRadiusBlob({ name: 'dsBlobBR', steps: 6, seed: config.seed });
+
+  const output = [
+    '/* === Dynamic Shapes Studio — CSS Export === */',
+    '',
+    '/* 1. Clip-path animation (moderni browser) */',
+    kf1,
+    '.ds-blob-clip {',
+    '  animation: dsBlobClip 4s ease-in-out infinite alternate;',
+    `  background: ${config.fill};`,
+    '}',
+    '',
+    '/* 2. SVG path d animation (Chrome/Edge) */',
+    kf2,
+    '',
+    '/* 3. Border-radius blob (massima compatibilità) */',
+    brFull,
+    '',
+    '/* 4. CSS Variables */',
+    `:root {`,
+    `  --ds-fill: ${config.fill};`,
+    `  --ds-fill2: ${config.fillColor2};`,
+    `  --ds-radius: ${config.radius}px;`,
+    `  --ds-bg: ${config.background};`,
+    `}`,
+  ].join('\n');
+
+  downloadCSS(output, 'dynamic-shape.css');
+  toast('✓ CSS scaricato');
+});
+
+// ── Export JSON Config ────────────────────────────────────────
+document.getElementById('btn-json').addEventListener('click', () => {
+  downloadJSON(config, 'dynamic-shape-config.json');
+  toast('✓ JSON Config scaricato');
+});
+
+// ── Export Lottie JSON ────────────────────────────────────────
+document.getElementById('btn-lottie').addEventListener('click', () => {
+  const paths = recordingPathFrames.slice(0, 60);
+  const lottie = generateLottieJSON({
+    name: 'Dynamic Shape',
+    width: config.width,
+    height: config.height,
+    fps: 30,
+    duration: Math.max(2, paths.length / 30),
+    pathFrames: paths,
+  });
+  const blob = new Blob([JSON.stringify(lottie, null, 2)], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'dynamic-shape-lottie.json';
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); document.body.removeChild(a); }, 1000);
+  toast('✓ Lottie JSON scaricato');
+});
+
+// ── Export React Component ────────────────────────────────────
+document.getElementById('btn-react').addEventListener('click', () => {
+  const { code, filename } = generateReactComponent(config, { componentName: 'DynamicBlob', typescript: false, animated: true });
+  downloadReactComponent(code, filename);
+  toast('✓ React Component scaricato');
+});
+
+document.getElementById('btn-hook').addEventListener('click', () => {
+  const code = generateReactHook(config, { hookName: 'useDynamicBlob' });
+  const blob = new Blob([code], { type: 'text/javascript' });
+  const url  = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'useDynamicBlob.js';
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); document.body.removeChild(a); }, 1000);
+  toast('✓ React Hook scaricato');
+});
+
+// ── Copia SVG ─────────────────────────────────────────────────
+document.getElementById('btn-copy-svg').addEventListener('click', async () => {
+  if (config.renderer !== 'svg') { toast('⚠ Passa al renderer SVG'); return; }
+  const str = getSVGString(renderer.svg);
+  await copySVGToClipboard(str);
+  toast('⎘ SVG copiato negli appunti');
+});
+
+document.getElementById('btn-copy-path').addEventListener('click', async () => {
+  const shapes = getShapeData(timeOffset);
+  if (!shapes.length) return;
+  try {
+    await navigator.clipboard.writeText(shapes[0].path);
+    toast('⎘ Path "d" copiato negli appunti');
+  } catch {
+    toast('⚠ Errore copia path');
+  }
+});
+
+// ── GIF Recording ─────────────────────────────────────────────
+document.getElementById('btn-gif-start').addEventListener('click', () => {
+  if (config.renderer !== 'canvas') {
+    toast('⚠ Passa al renderer Canvas per registrare GIF');
+    return;
+  }
+  gifRecorder = new GIFRecorder({ canvas: renderer.canvas, fps: 12, quality: 10 });
+  gifRecorder.start();
+  document.getElementById('btn-gif-start').style.display = 'none';
+  document.getElementById('btn-gif-stop').style.display  = 'block';
+  toast('⏺ Registrazione avviata…');
+});
+
+document.getElementById('btn-gif-stop').addEventListener('click', async () => {
+  if (!gifRecorder) return;
+  const count = gifRecorder.stop();
+  document.getElementById('btn-gif-stop').style.display  = 'none';
+  document.getElementById('btn-gif-start').style.display = 'block';
+  toast(`⏹ ${count} frame — generazione GIF…`);
+  await gifRecorder.exportGIF('dynamic-shape.gif');
+  gifRecorder = null;
+  toast('✓ GIF scaricata!', 3000);
+});
+
+// ── Modal Codice ──────────────────────────────────────────────
+let currentTab = 'jsx';
+
+const modalCodes = {
+  jsx:     () => generateReactComponent(config, { animated: true }).code,
+  hook:    () => generateReactHook(config),
+  vanilla: () => generateVanillaCode(),
+  css:     () => {
+    const { full } = generateBorderRadiusBlob({ name: 'dsBlobBR', steps: 6, seed: config.seed });
+    const kf = generateCSSKeyframes({
+      name: 'dsBlobClip',
+      paths: recordingPathFrames.slice(0, 10),
+      property: 'clip-path',
+    });
+    return [kf, '', full].join('\n');
+  },
+};
+
+const modalFilenames = {
+  jsx: 'DynamicBlob.jsx', hook: 'useDynamicBlob.js',
+  vanilla: 'dynamic-blob.js', css: 'dynamic-blob.css',
+};
+
+function generateVanillaCode() {
+  return `// Dynamic Shapes Studio — Vanilla JS
+// Incolla questo script in qualsiasi pagina HTML
+
+(function() {
+  // ── Simplex Noise (inline, no deps) ──
+  function createNoise(seed) {
+    const F2 = 0.5*(Math.sqrt(3)-1), G2=(3-Math.sqrt(3))/6;
+    const grad = [[1,1],[−1,1],[1,−1],[−1,−1],[1,0],[−1,0],[0,1],[0,−1]];
+    const p = Array.from({length:256},(_,i)=>i);
+    let s = Math.floor(seed*0xFFFFFFFF);
+    for(let i=255;i>0;i--){
+      s=Math.imul(s^s>>>15,s|1);s^=s+Math.imul(s^s>>>7,s|61);
+      const j=((s^s>>>14)>>>0)%(i+1);[p[i],p[j]]=[p[j],p[i]];
+    }
+    const perm=new Uint8Array(512);
+    for(let i=0;i<512;i++) perm[i]=p[i&255];
+    const dot=(g,x,y)=>g[0]*x+g[1]*y;
+    return function noise2D(xin,yin){
+      const s2=(xin+yin)*F2;
+      const i=Math.floor(xin+s2),j=Math.floor(yin+s2),t=(i+j)*G2;
+      const x0=xin-(i-t),y0=yin-(j-t);
+      const [i1,j1]=x0>y0?[1,0]:[0,1];
+      const x1=x0-i1+G2,y1=y0-j1+G2,x2=x0-1+2*G2,y2=y0-1+2*G2;
+      const ii=i&255,jj=j&255;
+      const gi0=perm[ii+perm[jj]]%8,gi1=perm[ii+i1+perm[jj+j1]]%8,gi2=perm[ii+1+perm[jj+1]]%8;
+      let t0=0.5-x0*x0-y0*y0; const n0=t0<0?0:(t0*=t0,t0*t0*dot(grad[gi0],x0,y0));
+      let t1=0.5-x1*x1-y1*y1; const n1=t1<0?0:(t1*=t1,t1*t1*dot(grad[gi1],x1,y1));
+      let t2=0.5-x2*x2-y2*y2; const n2=t2<0?0:(t2*=t2,t2*t2*dot(grad[gi2],x2,y2));
+      return 70*(n0+n1+n2);
+    };
+  }
+
+  // ── Spline Catmull-Rom → SVG path ──
+  function toPath(pts, tension) {
+    const p=[...pts,pts[0],pts[1]];
+    let d=\`M\${pts[0].x},\${pts[0].y}\`;
+    const t=tension/3;
+    for(let i=0;i<pts.length;i++){
+      const p0=p[Math.max(i-1,0)],p1=p[i],p2=p[i+1],p3=p[Math.min(i+2,p.length-1)];
+      d+=\` C\${(p1.x+(p2.x-p0.x)*t).toFixed(2)},\${(p1.y+(p2.y-p0.y)*t).toFixed(2)}\`
+       +\` \${(p2.x-(p3.x-p1.x)*t).toFixed(2)},\${(p2.y-(p3.y-p1.y)*t).toFixed(2)}\`
+       +\` \${p2.x.toFixed(2)},\${p2.y.toFixed(2)}\`;
+    }
+    return d+'Z';
+  }
+
+  // ── Config ──
+  const cfg = {
+    width:${config.width}, height:${config.height},
+    cx:${Math.round(config.width/2)}, cy:${Math.round(config.height/2)},
+    radius:${config.radius}, numPoints:${config.numPoints},
+    noiseStrength:${config.noiseStrength}, noiseScale:${config.noiseScale},
+    speed:${config.speed}, seed:${config.seed}, tension:${config.tension},
+    fill:'${config.fill}', stroke:'${config.stroke}',
+    strokeWidth:${config.strokeWidth}, background:'${config.background}',
+  };
+
+  const noise2D = createNoise(cfg.seed);
+  let time = 0;
+
+  // ── Crea SVG ──
+  const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('viewBox',\`0 0 \${cfg.width} \${cfg.height}\`);
+  svg.setAttribute('width',cfg.width);
+  svg.setAttribute('height',cfg.height);
+  svg.style.background = cfg.background;
+  document.body.appendChild(svg);
+
+  const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+  path.setAttribute('fill', cfg.fill);
+  if(cfg.strokeWidth>0){
+    path.setAttribute('stroke',cfg.stroke);
+    path.setAttribute('stroke-width',cfg.strokeWidth);
+  }
+  svg.appendChild(path);
+
+  // ── Loop ──
+  (function tick(){
+    time += cfg.speed;
+    const pts=[];
+    for(let i=0;i<cfg.numPoints;i++){
+      const a=(i/cfg.numPoints)*Math.PI*2;
+      const n=noise2D(Math.cos(a)*cfg.noiseScale+time, Math.sin(a)*cfg.noiseScale+time);
+      const r=cfg.radius+n*cfg.noiseStrength;
+      pts.push({x:cfg.cx+Math.cos(a)*r, y:cfg.cy+Math.sin(a)*r});
+    }
+    path.setAttribute('d', toPath(pts, cfg.tension));
+    requestAnimationFrame(tick);
+  })();
+})();`;
+}
+
+document.getElementById('btn-code').addEventListener('click', () => {
+  openModal(currentTab);
+});
+
+function openModal(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.modal-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.tab === tab);
+  });
+  const code = modalCodes[tab] ? modalCodes[tab]() : '';
+  document.getElementById('modal-code').textContent = code;
+  document.getElementById('modal-overlay').classList.add('open');
+}
+
+document.querySelectorAll('.modal-tab').forEach(t => {
+  t.addEventListener('click', () => openModal(t.dataset.tab));
+});
+
+document.getElementById('modal-close').addEventListener('click', () => {
+  document.getElementById('modal-overlay').classList.remove('open');
+});
+
+document.getElementById('modal-overlay').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('modal-overlay')) {
+    document.getElementById('modal-overlay').classList.remove('open');
+  }
+});
+
+document.getElementById('btn-modal-copy').addEventListener('click', async () => {
+  const code = document.getElementById('modal-code').textContent;
+  await navigator.clipboard.writeText(code);
+  toast('⎘ Codice copiato!');
+});
+
+document.getElementById('btn-modal-download').addEventListener('click', () => {
+  const code = document.getElementById('modal-code').textContent;
+  const filename = modalFilenames[currentTab] || 'export.txt';
+  const blob = new Blob([code], { type: 'text/plain' });
+  const url  = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); document.body.removeChild(a); }, 1000);
+  toast(`✓ ${filename} scaricato`);
+});
+
+// Tasto Escape chiude modal
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') document.getElementById('modal-overlay').classList.remove('open');
+});
+
+// ── Avvio ─────────────────────────────────────────────────────
+rebuildRenderer();
+
+</script>
+</body>
+</html>

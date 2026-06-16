@@ -1,0 +1,15 @@
+{
+  "name": "dynamic-shapes-studio",
+  "version": "1.0.0",
+  "description": "Generatore di forme vettoriali dinamiche — standalone UI + libreria",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "npx serve . --open",
+    "dev": "npx live-server --open=index.html",
+    "build": "npx esbuild src/index.js --bundle --format=esm --outfile=dist/dynamic-shapes-studio.esm.js && npx esbuild src/index.js --bundle --format=iife --global-name=DynamicShapes --outfile=dist/dynamic-shapes-studio.iife.js",
+    "studio": "open index.html"
+  },
+  "keywords": ["svg", "blob", "animation", "generative", "shapes", "canvas", "webgl"],
+  "license": "MIT"
+}
