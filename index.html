@@ -1,3 +1,186 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dynamic Shapes Studio</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    .app {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      min-height: 100vh;
+    }
+    .sidebar {
+      padding: 14px;
+      border-right: 1px solid #1e293b;
+      overflow: auto;
+      background: #111827;
+    }
+    .content {
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .toolbar, .info {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .toolbar button, .toolbar select, .modal button {
+      background: #1f2937;
+      border: 1px solid #334155;
+      color: #e5e7eb;
+      border-radius: 8px;
+      padding: 8px 10px;
+      cursor: pointer;
+    }
+    .toolbar button:hover, .modal button:hover, .modal-tab.active {
+      background: #334155;
+    }
+    #canvas-wrapper {
+      min-height: 620px;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      background: #020617;
+      overflow: hidden;
+    }
+    .dss-panel { display: grid; gap: 8px; }
+    .dss-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 8px;
+      align-items: center;
+      margin: 8px 0;
+    }
+    .dss-row input[type="color"] { width: 44px; height: 30px; padding: 0; border: none; }
+    .dss-value { min-width: 48px; text-align: right; color: #93c5fd; }
+    #toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 10px 12px;
+      opacity: 0;
+      transform: translateY(8px);
+      transition: all .2s ease;
+      pointer-events: none;
+    }
+    #toast.show { opacity: 1; transform: translateY(0); }
+    #modal-overlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      place-items: center;
+      background: rgba(2, 6, 23, 0.7);
+      backdrop-filter: blur(2px);
+    }
+    #modal-overlay.open { display: grid; }
+    .modal {
+      width: min(900px, 92vw);
+      max-height: 90vh;
+      background: #0b1220;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    #modal-code {
+      margin: 0;
+      max-height: 60vh;
+      overflow: auto;
+      background: #020617;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+      padding: 12px;
+      white-space: pre;
+    }
+    @media (max-width: 980px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar { border-right: none; border-bottom: 1px solid #1e293b; }
+      #canvas-wrapper { min-height: 420px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="toolbar" style="margin-bottom:10px;">
+        <label for="renderer-select">Renderer</label>
+        <select id="renderer-select">
+          <option value="svg">svg</option>
+          <option value="canvas">canvas</option>
+          <option value="webgl">webgl</option>
+        </select>
+      </div>
+      <div id="dss-controls"></div>
+    </aside>
+
+    <main class="content">
+      <div class="toolbar">
+        <button id="btn-randomize">Randomize</button>
+        <button id="btn-reset">Reset</button>
+        <button id="btn-svg">SVG</button>
+        <button id="btn-png">PNG</button>
+        <button id="btn-png2x">PNG 2x</button>
+        <button id="btn-css">CSS</button>
+        <button id="btn-json">JSON</button>
+        <button id="btn-lottie">Lottie</button>
+        <button id="btn-react">React</button>
+        <button id="btn-hook">Hook</button>
+        <button id="btn-copy-svg">Copy SVG</button>
+        <button id="btn-copy-path">Copy Path</button>
+        <button id="btn-gif-start">Start GIF</button>
+        <button id="btn-gif-stop" style="display:none;">Stop GIF</button>
+        <button id="btn-code">Code</button>
+      </div>
+
+      <div class="info">
+        <span>Renderer: <strong id="info-renderer">SVG</strong></span>
+        <span>Size: <strong id="info-size">600 x 600</strong></span>
+        <span>Points: <strong id="info-points">12</strong></span>
+        <span>Shape: <strong id="info-shape">blob</strong></span>
+        <span>Frame: <strong id="info-frame">0</strong></span>
+        <span id="fps-counter">0 fps</span>
+      </div>
+
+      <div id="canvas-wrapper"></div>
+    </main>
+  </div>
+
+  <div id="toast" aria-live="polite"></div>
+
+  <div id="modal-overlay">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Code export">
+      <div class="toolbar">
+        <button class="modal-tab active" data-tab="jsx">JSX</button>
+        <button class="modal-tab" data-tab="hook">Hook</button>
+        <button class="modal-tab" data-tab="vanilla">Vanilla</button>
+        <button class="modal-tab" data-tab="css">CSS</button>
+      </div>
+      <pre id="modal-code"></pre>
+      <div class="toolbar">
+        <button id="btn-modal-copy">Copy</button>
+        <button id="btn-modal-download">Download</button>
+        <button id="modal-close">Close</button>
+      </div>
+    </div>
+  </div>
+
 <script type="module">
 // ══════════════════════════════════════════════════════════════
 // DYNAMIC SHAPES STUDIO — Application Logic

@@ -10,6 +10,19 @@
     "build": "npx esbuild src/index.js --bundle --format=esm --outfile=dist/dynamic-shapes-studio.esm.js && npx esbuild src/index.js --bundle --format=iife --global-name=DynamicShapes --outfile=dist/dynamic-shapes-studio.iife.js",
     "studio": "open index.html"
   },
-  "keywords": ["svg", "blob", "animation", "generative", "shapes", "canvas", "webgl"],
-  "license": "MIT"
+  "keywords": [
+    "svg",
+    "blob",
+    "animation",
+    "generative",
+    "shapes",
+    "canvas",
+    "webgl"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "live-server": "^1.2.2",
+    "serve": "^14.2.6"
+  }
 }
